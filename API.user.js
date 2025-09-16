@@ -1,9 +1,8 @@
 // ==UserScript==
-// @name         TM API Logger + Encrypted Storage + Remote Upload + DownloadOnReload
+// @name         TM API Logger + Encrypted + Reliable Download (FS API)
 // @namespace    http://tampermonkey.net/
-// @version      1.3
-// @description  Log fetch/XHR, encrypt logs, store to IndexedDB, upload to server, download session JSON on reload. Run at document-start.
-// @author       Bạn
+// @version      1.4
+// @description  Log fetch/XHR, encrypt, upload, and reliably save to local file using File System Access API or manual download fallback.
 // @match        *://*/*
 // @grant        none
 // @run-at       document-start
@@ -12,63 +11,232 @@
 (async () => {
   'use strict';
 
-  /*************************************************************************
-   * CONFIG
-   * - SERVER_URL: nơi POST logs (mã hóa)
-   * - SECRET_PASSPHRASE: passphrase dùng để derive key AES-GCM (bạn nên đổi)
-   * - UPLOAD_INTERVAL_MS: gửi định kỳ
-   * - DOWNLOAD_ENCRYPTED: nếu true thì file download on reload là file mã hóa; nếu false (mặc định) thì file plaintext JSON
-   *************************************************************************/
-  const SERVER_URL = 'https://example.com/receive-logs'; // <= Thay bằng server của bạn
-  const SECRET_PASSPHRASE = 'replace-this-with-a-strong-passphrase'; // <= Thay passphrase an toàn
-  const UPLOAD_INTERVAL_MS = 30_000; // gửi mỗi 30s
-  const DOWNLOAD_ENCRYPTED = false; // nếu true thì tải file mã hóa; false = tải plaintext
+  /************** CONFIG **************/
+  const SERVER_URL = 'https://example.com/receive-logs'; // thay server của bạn
+  const SECRET_PASSPHRASE = 'replace-this-with-a-strong-passphrase';
+  const UPLOAD_INTERVAL_MS = 30_000;
+  const AUTO_SAVE_INTERVAL_MS = 15_000; // khi FS API bật, ghi file mỗi 15s
   const CLIENT_ID = `${location.hostname}_${Math.random().toString(36).slice(2,10)}`;
+  /*************************************/
 
-  /*************************************************************************
-   * Utilities: base64, text enc/dec, subtle wrappers
-   *************************************************************************/
-  const te = new TextEncoder();
-  const td = new TextDecoder();
-
-  function bufToB64(buf) {
-    const bytes = new Uint8Array(buf);
-    let binary = '';
-    for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
-    return btoa(binary);
+  /********** Crypto helpers (AES-GCM via passphrase) **********/
+  const te = new TextEncoder(), td = new TextDecoder();
+  function bufToB64(buf){const bytes=new Uint8Array(buf);let b='';for(let i=0;i<bytes.byteLength;i++)b+=String.fromCharCode(bytes[i]);return btoa(b);}
+  function b64ToBuf(b64){const bin=atob(b64), len=bin.length, arr=new Uint8Array(len); for(let i=0;i<len;i++)arr[i]=bin.charCodeAt(i); return arr.buffer; }
+  async function deriveKey(pass, salt, iter=200000){
+    const base = await crypto.subtle.importKey('raw', te.encode(pass), {name:'PBKDF2'}, false, ['deriveKey']);
+    return crypto.subtle.deriveKey({name:'PBKDF2', salt, iterations: iter, hash:'SHA-256'}, base, {name:'AES-GCM', length:256}, false, ['encrypt','decrypt']);
   }
-  function b64ToBuf(b64) {
-    const binary = atob(b64);
-    const len = binary.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
-    return bytes.buffer;
-  }
-
-  async function deriveKeyFromPassphrase(passphrase, salt, iterations = 200000) {
-    const baseKey = await crypto.subtle.importKey(
-      'raw', te.encode(passphrase), { name: 'PBKDF2' }, false, ['deriveKey']
-    );
-    return crypto.subtle.deriveKey(
-      { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
-      baseKey,
-      { name: 'AES-GCM', length: 256 },
-      false,
-      ['encrypt', 'decrypt']
-    );
-  }
-
-  async function encryptString(plain, passphrase) {
+  async function encryptString(plain, pass){
     const salt = crypto.getRandomValues(new Uint8Array(16));
     const iv = crypto.getRandomValues(new Uint8Array(12));
-    const key = await deriveKeyFromPassphrase(passphrase, salt);
-    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, te.encode(plain));
-    return {
-      salt: bufToB64(salt.buffer),
-      iv: bufToB64(iv.buffer),
-      ciphertext: bufToB64(ct)
-    };
+    const key = await deriveKey(pass, salt);
+    const ct = await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, te.encode(plain));
+    return { salt: bufToB64(salt.buffer), iv: bufToB64(iv.buffer), ciphertext: bufToB64(ct) };
   }
+  async function decryptToString(obj, pass){
+    const salt = b64ToBuf(obj.salt), iv = b64ToBuf(obj.iv), ct = b64ToBuf(obj.ciphertext);
+    const key = await deriveKey(pass, salt);
+    const plainBuf = await crypto.subtle.decrypt({name:'AES-GCM', iv}, key, ct);
+    return td.decode(plainBuf);
+  }
+
+  /********** IndexedDB for encrypted logs **********/
+  const DB_NAME = 'tm_api_logger_enc_db_v1';
+  const STORE = 'enc_logs';
+  let dbPromise = null;
+  function openDB(){
+    if(dbPromise) return dbPromise;
+    dbPromise = new Promise((res, rej) => {
+      const r = indexedDB.open(DB_NAME, 1);
+      r.onupgradeneeded = (e)=>{ const db = e.target.result; if(!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE, {keyPath:'id', autoIncrement:true}); };
+      r.onsuccess = (e)=>res(e.target.result);
+      r.onerror = (e)=>rej(e.target.error);
+    });
+    return dbPromise;
+  }
+  async function addEncryptedToDB(encObj, meta={}){
+    try{ const db = await openDB(); const tx = db.transaction(STORE,'readwrite'); tx.objectStore(STORE).add({ts:Date.now(), meta, enc:encObj}); return true; }catch(e){console.error(e);return false;}
+  }
+  async function getAllEncryptedFromDB(){ const db = await openDB(); return new Promise((res, rej)=>{ const tx=db.transaction(STORE,'readonly'); const r=tx.objectStore(STORE).getAll(); r.onsuccess=(e)=>res(e.target.result||[]); r.onerror=(e)=>rej(e.target.error); }); }
+
+  /********** In-memory plaintext session logs (for download fallback) **********/
+  const sessionLogs = [];
+
+  /********** Upload queue **********/
+  const pendingUploads = [];
+  function enqueueUpload(obj){ pendingUploads.push(obj); }
+  async function flushUploads(){
+    if(!pendingUploads.length) return;
+    const batch = pendingUploads.splice(0, pendingUploads.length);
+    try{
+      const res = await fetch(SERVER_URL, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ client: CLIENT_ID, items: batch }) });
+      if(!res.ok){ console.warn('upload non-ok', res.status); pendingUploads.unshift(...batch); }
+      else console.info('uploaded', batch.length);
+    }catch(e){ console.warn('upload failed', e); pendingUploads.unshift(...batch); }
+  }
+  setInterval(flushUploads, UPLOAD_INTERVAL_MS);
+
+  /********** saveLogObject: plaintext->encrypt->DB->enqueue **********/
+  async function saveLogObject(obj){
+    try{
+      sessionLogs.push(obj);
+      const plain = JSON.stringify(obj);
+      const enc = await encryptString(plain, SECRET_PASSPHRASE);
+      await addEncryptedToDB(enc, {url:location.href});
+      enqueueUpload({ client: CLIENT_ID, ts: Date.now(), enc });
+    }catch(e){ console.error('saveLogObject', e); }
+  }
+
+  /********** Patch fetch & XHR to capture req/res **********/
+  try{
+    const origFetch = window.fetch;
+    window.fetch = async function(input, init){
+      const url = typeof input === 'string' ? input : input && input.url;
+      const method = (init && init.method) || (input && input.method) || 'GET';
+      const headers = (init && init.headers) || {};
+      const body = (init && init.body) || null;
+      const meta = { type:'fetch', url, method };
+      let res;
+      try{ res = await origFetch.apply(this, arguments); } catch(err){ await saveLogObject({...meta, stage:'network-error', error:String(err)}); throw err; }
+      try{
+        const cloned = res.clone();
+        const ct = cloned.headers.get('content-type') || '';
+        let text = '<no-text>';
+        try{ text = await cloned.text(); }catch(e){ text = '<non-text or too large>'; }
+        const parsed = ct.includes('application/json') ? tryParseJSON(text) : text;
+        await saveLogObject({...meta, stage:'response', status:res.status, statusText:res.statusText, headers:Array.from(res.headers.entries()), body:parsed});
+      }catch(e){ console.error('fetch read error', e); }
+      return res;
+    };
+  }catch(e){ console.error('fetch patch fail', e); }
+
+  try{
+    const RealXHR = window.XMLHttpRequest;
+    function XHRProxy(){ const xhr = new RealXHR(); let meta={type:'xhr',url:null,method:null,body:null,ts:null}; const oopen=xhr.open; xhr.open=function(m,u){ meta.method=m; meta.url=u; meta.ts=Date.now(); return oopen.apply(xhr, arguments); }; const osend=xhr.send; xhr.send=function(b){ meta.body=b; xhr.addEventListener('readystatechange', function(){ if(xhr.readyState===4){ let resp='<no-resp>'; try{ resp=xhr.responseText; }catch(e){} saveLogObject({...meta, stage:'xhr-response', status:xhr.status, responseType:xhr.responseType, body:tryParseJSON(resp)}); } }); return osend.apply(xhr, arguments); }; return xhr; }
+    XHRProxy.prototype = RealXHR.prototype; window.XMLHttpRequest = XHRProxy;
+  }catch(e){ console.error('XHR patch fail', e); }
+
+  function tryParseJSON(s){ try{return JSON.parse(s);}catch(e){return s;} }
+
+  /********** Reliable local save: File System Access API **********/
+  let fileHandle = null;
+  let fileWritable = null;
+  let autoSaveEnabled = false;
+
+  async function requestFileHandleAndWriteInitial(){
+    if(!('showSaveFilePicker' in window)) { alert('Trình duyệt không hỗ trợ File System Access API. Hãy dùng nút "Download Logs".'); return false; }
+    try{
+      fileHandle = await window.showSaveFilePicker({ suggestedName: `tm_logs_${location.hostname}.json`, types: [{ description:'JSON', accept: {'application/json':['.json']} }] });
+      fileWritable = await fileHandle.createWritable();
+      // write initial snapshot
+      const data = JSON.stringify({ client: CLIENT_ID, ts: Date.now(), logs: sessionLogs }, null, 2);
+      await fileWritable.write(data);
+      // keep fileWritable closed for now (we'll reopen each write to ensure data persisted)
+      await fileWritable.close();
+      fileWritable = null;
+      return true;
+    }catch(e){ console.error('requestFileHandle error', e); return false; }
+  }
+
+  async function writeWholeSessionToFile(){
+    if(!fileHandle) return false;
+    try{
+      const w = await fileHandle.createWritable(); // truncate by default
+      const data = JSON.stringify({ client: CLIENT_ID, ts: Date.now(), logs: sessionLogs }, null, 2);
+      await w.write(data);
+      await w.close();
+      return true;
+    }catch(e){ console.error('writeWholeSessionToFile', e); return false; }
+  }
+
+  // periodic autosave if enabled
+  let autosaveIntervalId = null;
+  function startAutoSave(){
+    if(autosaveIntervalId) clearInterval(autosaveIntervalId);
+    autosaveIntervalId = setInterval(() => { if(fileHandle) writeWholeSessionToFile(); }, AUTO_SAVE_INTERVAL_MS);
+  }
+  function stopAutoSave(){ if(autosaveIntervalId) clearInterval(autosaveIntervalId); autosaveIntervalId = null; }
+
+  /********** Manual export fallback (download blob) **********/
+  async function downloadSessionPlaintext(){
+    try{
+      const blob = new Blob([JSON.stringify({ client: CLIENT_ID, ts: Date.now(), logs: sessionLogs }, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `tm_session_logs_${location.hostname}_${Date.now()}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      return true;
+    }catch(e){ console.error('downloadSessionPlaintext', e); return false; }
+  }
+  async function downloadEncryptedDB(){
+    try{
+      const arr = await getAllEncryptedFromDB();
+      const blob = new Blob([JSON.stringify({ client: CLIENT_ID, ts: Date.now(), items: arr }, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `tm_session_logs_enc_${location.hostname}_${Date.now()}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      return true;
+    }catch(e){ console.error('downloadEncryptedDB', e); return false; }
+  }
+
+  /********** beforeunload: try to persist last changes **********/
+  window.addEventListener('beforeunload', (ev) => {
+    try{
+      // try beacon upload
+      if(pendingUploads.length) {
+        try {
+          const payload = JSON.stringify({ client: CLIENT_ID, items: pendingUploads.splice(0, pendingUploads.length) });
+          const blob = new Blob([payload], { type:'application/json' });
+          if(navigator.sendBeacon) navigator.sendBeacon(SERVER_URL, blob);
+        } catch(e){}
+      }
+      // if FS API fileHandle exists, try a final synchronous-ish write by awaiting (some browsers may cancel)
+      if(fileHandle){
+        // attempt to write but do not block unload (best-effort)
+        writeWholeSessionToFile().catch(()=>{});
+      } else {
+        // fallback: trigger download (may be blocked in many browsers)
+        downloadSessionPlaintext().catch(()=>{});
+      }
+    }catch(e){}
+  });
+
+  /********** UI **********/
+  function createUI(){
+    try{
+      const container = document.createElement('div');
+      container.style.position = 'fixed'; container.style.right='8px'; container.style.bottom='8px';
+      container.style.zIndex=999999; container.style.display='flex'; container.style.flexDirection='column'; container.style.gap='6px'; container.style.opacity='0.95';
+
+      const btnDownload = document.createElement('button'); btnDownload.innerText='Download Logs'; btnDownload.title='Tải file logs plaintext'; btnDownload.onclick = () => downloadSessionPlaintext();
+      const btnDownloadEnc = document.createElement('button'); btnDownloadEnc.innerText='Download Encrypted DB'; btnDownloadEnc.title='Tải file logs đã mã hóa (IndexedDB)'; btnDownloadEnc.onclick = () => downloadEncryptedDB();
+      const btnEnableFS = document.createElement('button'); btnEnableFS.innerText='Enable Auto Save (FS API)'; btnEnableFS.title='Cho phép lưu tự động vào 1 file trên máy (mở popup chọn file 1 lần)'; btnEnableFS.onclick = async () => {
+        const ok = await requestFileHandleAndWriteInitial();
+        if(ok){ autoSaveEnabled = true; startAutoSave(); alert('Auto Save enabled. File will be updated periodically.'); btnEnableFS.innerText='Auto Save: ON'; }
+        else alert('Không bật Auto Save (FS API) — trình duyệt có thể không hỗ trợ hoặc bạn hủy.');
+      };
+      const btnForceUpload = document.createElement('button'); btnForceUpload.innerText='Force Upload'; btnForceUpload.onclick = () => flushUploads();
+      [btnDownload, btnDownloadEnc, btnEnableFS, btnForceUpload].forEach(b=>{ b.style.padding='6px 8px'; b.style.fontSize='12px'; b.style.borderRadius='6px'; b.style.boxShadow='0 2px 6px rgba(0,0,0,0.12)'; container.appendChild(b); });
+
+      document.documentElement.appendChild(container);
+    }catch(e){}
+  }
+  if(document.readyState==='complete' || document.readyState==='interactive') createUI(); else window.addEventListener('DOMContentLoaded', createUI);
+
+  /********** small debug console msg **********/
+  console.info('[tm-api-logger] initialized. CLIENT_ID=', CLIENT_ID, ' - Use "Enable Auto Save (FS API)" to reliably save to disk, or click "Download Logs".');
+
+})();  }
 
   async function decryptToString({ salt, iv, ciphertext }, passphrase) {
     try {
@@ -521,3 +689,4 @@
 
 
 })();
+
