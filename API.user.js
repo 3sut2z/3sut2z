@@ -1,7 +1,6 @@
 // ==UserScript==
 // @name         TM API Logger + Encrypted + Reliable Download (FS API)
-// @namespace    http://tampermonkey.net/
-// @version      1.4
+// @version      1.4.5
 // @description  Log fetch/XHR, encrypt, upload, and reliably save to local file using File System Access API or manual download fallback.
 // @match        *://*/*
 // @grant        none
@@ -15,7 +14,7 @@
   const SERVER_URL = 'https://example.com/receive-logs'; // thay server của bạn
   const SECRET_PASSPHRASE = 'replace-this-with-a-strong-passphrase';
   const UPLOAD_INTERVAL_MS = 30_000;
-  const AUTO_SAVE_INTERVAL_MS = 15_000; // khi FS API bật, ghi file mỗi 15s
+  const AUTO_SAVE_INTERVAL_MS = 1_000; // khi FS API bật, ghi file mỗi 15s
   const CLIENT_ID = `${location.hostname}_${Math.random().toString(36).slice(2,10)}`;
   /*************************************/
 
@@ -689,4 +688,5 @@
 
 
 })();
+
 
