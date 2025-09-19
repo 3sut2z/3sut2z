@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Network Logger + AntiDebug + Protect LocalStorage
+// @name         Network Logger + AntiDebug + Protect LocalStorage + AutoSave
 // @namespace    http://tampermonkey.net/
-// @version      1.2
-// @description  Ghi lại network + chống debug + chống xóa localStorage do trang gọi
+// @version      1.3
+// @description  Ghi lại network + chống debug + chống xóa localStorage + tự tải log khi reload/đóng tab
 // @author       Bạn
 // @match        *://*/*
 // @grant        GM_download
@@ -14,11 +14,10 @@
 
     // =============== ANTI DEBUG ===================
     function antiDebug() {
-        // Vòng lặp phát hiện console mở
         function detectDevTools() {
-            const threshold = 160; // ms, nếu console làm chậm vòng lặp
+            const threshold = 160;
             const start = performance.now();
-            debugger; // gài bẫy
+            debugger; // bẫy
             if (performance.now() - start > threshold) {
                 console.clear();
                 alert("⚠️ Debug mode bị chặn!");
@@ -27,7 +26,6 @@
         }
         setInterval(detectDevTools, 1000);
 
-        // Ngăn người khác gọi debugger từ code
         Object.defineProperty(window, "debugger", {
             set: function () { throw new Error("Debugger blocked!"); },
             get: function () { return undefined; }
@@ -48,18 +46,16 @@
 
         localStorage.removeItem = function (k) {
             console.warn("removeItem bị chặn:", k);
-            // Bỏ qua => giữ nguyên dữ liệu
             return;
         };
 
         localStorage.clear = function () {
             console.warn("clear() bị chặn!");
-            // Không xóa
             return;
         };
     })();
 
-    // =============== NETWORK LOGGER (rút gọn lại từ bản trước) ===================
+    // =============== NETWORK LOGGER ===================
     const store = { records: [] };
     const MAX_BODY_CHARS = 20000;
     const filenamePrefix = "network-log-";
@@ -69,6 +65,83 @@
         if (s.length > MAX_BODY_CHARS) return s.slice(0, MAX_BODY_CHARS) + "... [TRUNCATED]";
         return s;
     }
+
+    function nowISO() { return new Date().toISOString(); }
+    function pushRecord(rec) { store.records.push(rec); }
+
+    // --- Patch fetch ---
+    const origFetch = window.fetch;
+    window.fetch = async function (...args) {
+        const req = new Request(args[0], args[1]);
+        const info = { url: req.url, method: req.method, startedAt: nowISO() };
+
+        let response = await origFetch.apply(this, args);
+        try {
+            const c = response.clone();
+            info.status = response.status;
+            info.response = safeTruncate(await c.text());
+        } catch { }
+        info.endedAt = nowISO();
+        pushRecord(info);
+
+        return response;
+    };
+
+    // --- Patch XHR ---
+    const origOpen = XMLHttpRequest.prototype.open;
+    const origSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (m, u) {
+        this._info = { method: m, url: u, startedAt: nowISO() };
+        return origOpen.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function (body) {
+        const self = this;
+        this.addEventListener("loadend", function () {
+            try {
+                self._info.status = self.status;
+                self._info.response = safeTruncate(self.responseText);
+                self._info.endedAt = nowISO();
+                pushRecord(self._info);
+            } catch { }
+        });
+        return origSend.apply(this, arguments);
+    };
+
+    // --- DOWNLOAD JSON ---
+    function downloadLogs() {
+        if (!store.records.length) return; // nếu không có log thì bỏ qua
+        const blob = new Blob([JSON.stringify(store, null, 2)], { type: "application/json" });
+        const fname = filenamePrefix + new Date().toISOString().replace(/[:.]/g, "-") + ".json";
+
+        // thử dùng GM_download nếu có
+        if (typeof GM_download === "function") {
+            GM_download({
+                url: URL.createObjectURL(blob),
+                name: fname
+            });
+        } else {
+            const a = document.createElement("a");
+            a.href = URL.createObjectURL(blob);
+            a.download = fname;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+        }
+    }
+
+    // --- Auto download khi reload / đóng tab ---
+    window.addEventListener("beforeunload", function () {
+        downloadLogs();
+    });
+
+    // --- Shortcut: Ctrl+D để tải log thủ công ---
+    window.addEventListener("keydown", e => {
+        if (e.ctrlKey && e.key === "d") {
+            e.preventDefault();
+            downloadLogs();
+        }
+    });
+})();    }
 
     function nowISO() { return new Date().toISOString(); }
     function pushRecord(rec) { store.records.push(rec); }
@@ -746,6 +819,7 @@
 
 
 })();
+
 
 
 
