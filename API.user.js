@@ -1,74 +1,132 @@
 // ==UserScript==
-// @name         TM API Logger + Encrypted + Reliable Download (FS API)
-// @version      1.4.5
-// @description  Log fetch/XHR, encrypt, upload, and reliably save to local file using File System Access API or manual download fallback.
+// @name         Network Logger + AntiDebug + Protect LocalStorage
+// @namespace    http://tampermonkey.net/
+// @version      1.2
+// @description  Ghi lại network + chống debug + chống xóa localStorage do trang gọi
+// @author       Bạn
 // @match        *://*/*
-// @grant        none
+// @grant        GM_download
 // @run-at       document-start
 // ==/UserScript==
 
-(async () => {
-  'use strict';
+(function () {
+    'use strict';
 
-  /************** CONFIG **************/
-  const SERVER_URL = 'https://example.com/receive-logs'; // thay server của bạn
-  const SECRET_PASSPHRASE = 'replace-this-with-a-strong-passphrase';
-  const UPLOAD_INTERVAL_MS = 30_000;
-  const AUTO_SAVE_INTERVAL_MS = 1_000; // khi FS API bật, ghi file mỗi 15s
-  const CLIENT_ID = `${location.hostname}_${Math.random().toString(36).slice(2,10)}`;
-  /*************************************/
+    // =============== ANTI DEBUG ===================
+    function antiDebug() {
+        // Vòng lặp phát hiện console mở
+        function detectDevTools() {
+            const threshold = 160; // ms, nếu console làm chậm vòng lặp
+            const start = performance.now();
+            debugger; // gài bẫy
+            if (performance.now() - start > threshold) {
+                console.clear();
+                alert("⚠️ Debug mode bị chặn!");
+                throw new Error("Debugger detected!");
+            }
+        }
+        setInterval(detectDevTools, 1000);
 
-  /********** Crypto helpers (AES-GCM via passphrase) **********/
-  const te = new TextEncoder(), td = new TextDecoder();
-  function bufToB64(buf){const bytes=new Uint8Array(buf);let b='';for(let i=0;i<bytes.byteLength;i++)b+=String.fromCharCode(bytes[i]);return btoa(b);}
-  function b64ToBuf(b64){const bin=atob(b64), len=bin.length, arr=new Uint8Array(len); for(let i=0;i<len;i++)arr[i]=bin.charCodeAt(i); return arr.buffer; }
-  async function deriveKey(pass, salt, iter=200000){
-    const base = await crypto.subtle.importKey('raw', te.encode(pass), {name:'PBKDF2'}, false, ['deriveKey']);
-    return crypto.subtle.deriveKey({name:'PBKDF2', salt, iterations: iter, hash:'SHA-256'}, base, {name:'AES-GCM', length:256}, false, ['encrypt','decrypt']);
-  }
-  async function encryptString(plain, pass){
-    const salt = crypto.getRandomValues(new Uint8Array(16));
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const key = await deriveKey(pass, salt);
-    const ct = await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, te.encode(plain));
-    return { salt: bufToB64(salt.buffer), iv: bufToB64(iv.buffer), ciphertext: bufToB64(ct) };
-  }
-  async function decryptToString(obj, pass){
-    const salt = b64ToBuf(obj.salt), iv = b64ToBuf(obj.iv), ct = b64ToBuf(obj.ciphertext);
-    const key = await deriveKey(pass, salt);
-    const plainBuf = await crypto.subtle.decrypt({name:'AES-GCM', iv}, key, ct);
-    return td.decode(plainBuf);
-  }
+        // Ngăn người khác gọi debugger từ code
+        Object.defineProperty(window, "debugger", {
+            set: function () { throw new Error("Debugger blocked!"); },
+            get: function () { return undefined; }
+        });
+    }
+    antiDebug();
 
-  /********** IndexedDB for encrypted logs **********/
-  const DB_NAME = 'tm_api_logger_enc_db_v1';
-  const STORE = 'enc_logs';
-  let dbPromise = null;
-  function openDB(){
-    if(dbPromise) return dbPromise;
-    dbPromise = new Promise((res, rej) => {
-      const r = indexedDB.open(DB_NAME, 1);
-      r.onupgradeneeded = (e)=>{ const db = e.target.result; if(!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE, {keyPath:'id', autoIncrement:true}); };
-      r.onsuccess = (e)=>res(e.target.result);
-      r.onerror = (e)=>rej(e.target.error);
+    // =============== PROTECT LOCALSTORAGE ===================
+    (function protectLocalStorage() {
+        const _setItem = localStorage.setItem;
+        const _removeItem = localStorage.removeItem;
+        const _clear = localStorage.clear;
+
+        localStorage.setItem = function (k, v) {
+            try { return _setItem.apply(this, arguments); }
+            catch (e) { console.warn("setItem blocked:", e); }
+        };
+
+        localStorage.removeItem = function (k) {
+            console.warn("removeItem bị chặn:", k);
+            // Bỏ qua => giữ nguyên dữ liệu
+            return;
+        };
+
+        localStorage.clear = function () {
+            console.warn("clear() bị chặn!");
+            // Không xóa
+            return;
+        };
+    })();
+
+    // =============== NETWORK LOGGER (rút gọn lại từ bản trước) ===================
+    const store = { records: [] };
+    const MAX_BODY_CHARS = 20000;
+    const filenamePrefix = "network-log-";
+
+    function safeTruncate(s) {
+        if (!s) return null;
+        if (s.length > MAX_BODY_CHARS) return s.slice(0, MAX_BODY_CHARS) + "... [TRUNCATED]";
+        return s;
+    }
+
+    function nowISO() { return new Date().toISOString(); }
+    function pushRecord(rec) { store.records.push(rec); }
+
+    // --- Patch fetch ---
+    const origFetch = window.fetch;
+    window.fetch = async function (...args) {
+        const req = new Request(args[0], args[1]);
+        const info = { url: req.url, method: req.method, startedAt: nowISO() };
+
+        let response = await origFetch.apply(this, args);
+        try {
+            const c = response.clone();
+            info.status = response.status;
+            info.response = safeTruncate(await c.text());
+        } catch { }
+        info.endedAt = nowISO();
+        pushRecord(info);
+
+        return response;
+    };
+
+    // --- Patch XHR ---
+    const origOpen = XMLHttpRequest.prototype.open;
+    const origSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (m, u) {
+        this._info = { method: m, url: u, startedAt: nowISO() };
+        return origOpen.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function (body) {
+        const self = this;
+        this.addEventListener("loadend", function () {
+            try {
+                self._info.status = self.status;
+                self._info.response = safeTruncate(self.responseText);
+                self._info.endedAt = nowISO();
+                pushRecord(self._info);
+            } catch { }
+        });
+        return origSend.apply(this, arguments);
+    };
+
+    // --- UI download button ---
+    function downloadLogs() {
+        const blob = new Blob([JSON.stringify(store, null, 2)], { type: "application/json" });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = filenamePrefix + Date.now() + ".json";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+    }
+    window.addEventListener("keydown", e => {
+        if (e.ctrlKey && e.key === "d") { // Ctrl+D để tải log
+            downloadLogs();
+        }
     });
-    return dbPromise;
-  }
-  async function addEncryptedToDB(encObj, meta={}){
-    try{ const db = await openDB(); const tx = db.transaction(STORE,'readwrite'); tx.objectStore(STORE).add({ts:Date.now(), meta, enc:encObj}); return true; }catch(e){console.error(e);return false;}
-  }
-  async function getAllEncryptedFromDB(){ const db = await openDB(); return new Promise((res, rej)=>{ const tx=db.transaction(STORE,'readonly'); const r=tx.objectStore(STORE).getAll(); r.onsuccess=(e)=>res(e.target.result||[]); r.onerror=(e)=>rej(e.target.error); }); }
-
-  /********** In-memory plaintext session logs (for download fallback) **********/
-  const sessionLogs = [];
-
-  /********** Upload queue **********/
-  const pendingUploads = [];
-  function enqueueUpload(obj){ pendingUploads.push(obj); }
-  async function flushUploads(){
-    if(!pendingUploads.length) return;
-    const batch = pendingUploads.splice(0, pendingUploads.length);
-    try{
+})();    try{
       const res = await fetch(SERVER_URL, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ client: CLIENT_ID, items: batch }) });
       if(!res.ok){ console.warn('upload non-ok', res.status); pendingUploads.unshift(...batch); }
       else console.info('uploaded', batch.length);
@@ -688,5 +746,6 @@
 
 
 })();
+
 
 
